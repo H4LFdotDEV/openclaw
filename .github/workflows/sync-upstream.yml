@@ -1,0 +1,148 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      sync_method:
+        description: 'Sync method'
+        required: true
+        default: 'merge'
+        type: choice
+        options:
+          - merge
+          - rebase
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync with upstream openclaw/openclaw
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw.git || true
+          git fetch upstream main
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "Already up to date with upstream"
+          else
+            echo "Fork is $BEHIND commits behind upstream"
+          fi
+
+      - name: Attempt fast-forward merge
+        id: merge
+        if: steps.check.outputs.behind != '0'
+        continue-on-error: true
+        run: |
+          # Try fast-forward first
+          if git merge --ff-only upstream/main; then
+            echo "result=fast-forward" >> $GITHUB_OUTPUT
+          else
+            # Try regular merge
+            if git merge upstream/main -m "chore: Sync with upstream openclaw/openclaw"; then
+              echo "result=merged" >> $GITHUB_OUTPUT
+            else
+              git merge --abort
+              echo "result=conflict" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Push changes
+        if: steps.merge.outputs.result == 'fast-forward' || steps.merge.outputs.result == 'merged'
+        run: git push origin main
+
+      - name: Create PR for conflicts
+        if: steps.merge.outputs.result == 'conflict'
+        run: |
+          # Create a sync branch
+          BRANCH="sync-upstream-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH"
+
+          # Cherry-pick or merge with conflicts marked
+          git merge upstream/main --no-commit || true
+
+          # Check if there are actual conflicts
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            echo "Conflicts detected, creating PR for manual resolution"
+            git checkout --ours .
+            git add -A
+            git commit -m "chore: Sync upstream (conflicts need resolution)"
+            git push -u origin "$BRANCH"
+
+            gh pr create \
+              --title "chore: Sync with upstream openclaw/openclaw (conflicts)" \
+              --body "$(cat <<'EOF'
+          ## Upstream Sync
+
+          This PR syncs changes from [openclaw/openclaw](https://github.com/openclaw/openclaw).
+
+          **⚠️ Merge conflicts detected** - Manual resolution required.
+
+          ### Conflicts
+          The following files have conflicts that need manual resolution:
+          $(git diff --name-only --diff-filter=U upstream/main || echo "See diff for details")
+
+          ### How to resolve
+          1. Check out this branch locally
+          2. Run `git fetch upstream && git merge upstream/main`
+          3. Resolve conflicts
+          4. Push and merge this PR
+          EOF
+          )" \
+              --label "upstream-sync"
+          else
+            git add -A
+            git commit -m "chore: Sync with upstream openclaw/openclaw"
+            git push -u origin "$BRANCH"
+
+            gh pr create \
+              --title "chore: Sync with upstream openclaw/openclaw" \
+              --body "$(cat <<'EOF'
+          ## Upstream Sync
+
+          This PR syncs changes from [openclaw/openclaw](https://github.com/openclaw/openclaw).
+
+          Auto-merge was not possible, but no conflicts were detected. Please review and merge.
+          EOF
+          )" \
+              --label "upstream-sync"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.check.outputs.behind }}" == "0" ]; then
+            echo "✅ Already up to date with upstream" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.merge.outputs.result }}" == "fast-forward" ]; then
+            echo "✅ Fast-forwarded to upstream" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.merge.outputs.result }}" == "merged" ]; then
+            echo "✅ Merged upstream changes" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.merge.outputs.result }}" == "conflict" ]; then
+            echo "⚠️ Conflicts detected - PR created for manual resolution" >> $GITHUB_STEP_SUMMARY
+          fi
